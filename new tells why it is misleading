@@ -1,0 +1,238 @@
+import streamlit as st
+from transformers import pipeline
+import requests
+import yt_dlp
+import whisper
+import tempfile
+import os
+import spacy
+
+# -----------------------
+# 0️⃣ FFmpeg path (Windows)
+# -----------------------
+os.environ["FFMPEG_BINARY"] = r"C:\\ffmpeg\\ffmpeg-8.0-essentials_build\\bin\\ffmpeg.exe"
+
+# -----------------------
+# 1️⃣ Neon-style CSS
+# -----------------------
+st.markdown("""
+<style>
+body { background-color: #0f0f0f; color: #00ffea; }
+h1, h2, h3 { color: #ff00ff; }
+.stButton button { background-color: #00ffea; color: #000000; border-radius: 10px; }
+.stTextArea textarea { background-color: #1a1a1a; color: #00ffea; }
+.stMetric-label, .stMetric-value { color: #ff00ff; }
+</style>
+""", unsafe_allow_html=True)
+
+# -----------------------
+# 2️⃣ Load models
+# -----------------------
+@st.cache_resource
+def load_classifier():
+    return pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device=-1)
+
+@st.cache_resource
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("tiny")
+
+@st.cache_resource
+def load_nlp():
+    return spacy.load("en_core_web_sm")
+
+classifier = load_classifier()
+summarizer = load_summarizer()
+whisper_model = load_whisper()
+nlp = load_nlp()
+
+# -----------------------
+# 3️⃣ Misinformation scoring
+# -----------------------
+def compute_misinfo_score(text):
+    labels = ["misinformation", "credible"]
+    out = classifier(text, candidate_labels=labels, hypothesis_template="This text is {}.")
+    score = next(
+        (sc for lbl, sc in zip(out["labels"], out["scores"]) if lbl.lower() == "misinformation"),
+        0.0
+    )
+    return int(score * 100), out
+
+def categorize_score(score):
+    if score >= 70:
+        return "Fake / Likely Misinformation"
+    elif score >= 40:
+        return "Medium / Uncertain"
+    else:
+        return "Real / Credible"
+
+# -----------------------
+# 4️⃣ Why it might be misleading
+# -----------------------
+def explain_misleading(text, score):
+    reasons = []
+    if score >= 70:
+        reasons.append("⚠️ High misinformation likelihood detected.")
+    if any(word in text.lower() for word in ["clickbait", "shocking", "unbelievable"]):
+        reasons.append("🔹 Contains sensational language.")
+    if len(text.split()) < 30:
+        reasons.append("🔹 Very short text, may lack context.")
+    if not reasons:
+        reasons.append("✅ Content seems credible, no clear red flags detected.")
+    return reasons
+
+# -----------------------
+# 5️⃣ Fact-checking tips
+# -----------------------
+FACT_CHECK_TIPS = [
+    "1. Verify the source before trusting the content.",
+    "2. Cross-check with multiple reputable news outlets.",
+    "3. Look for evidence, references, or citations.",
+    "4. Avoid sharing information that seems sensational.",
+    "5. Use official fact-checking websites like Snopes or PolitiFact."
+]
+
+TRUSTED_SOURCES = {
+    "Snopes": "https://www.snopes.com/",
+    "PolitiFact": "https://www.politifact.com/",
+    "FactCheck.org": "https://www.factcheck.org/"
+}
+
+# -----------------------
+# 6️⃣ Entity extraction
+# -----------------------
+def extract_entities(text):
+    doc = nlp(text)
+    entities = [ent.text for ent in doc.ents if ent.label_ in ["PERSON", "ORG", "GPE", "LAW"]]
+    return " ".join(entities) if entities else text
+
+# -----------------------
+# 7️⃣ Summarization to bullets
+# -----------------------
+def summarize_to_bullets(text):
+    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+    summaries = [summarizer(chunk)[0]["summary_text"] for chunk in chunks]
+    combined = " ".join(summaries)
+    bullets = [f"• {sent.strip()}" for sent in combined.split(". ") if len(sent.strip()) > 20]
+    return bullets
+
+# -----------------------
+# 8️⃣ GNews API
+# -----------------------
+GNEWS_API_KEY = st.secrets["gnews"]["api_key"]
+
+def query_gnews(claim):
+    query = extract_entities(claim).strip()
+    if not query or len(query) > 100:
+        query = "global news"
+
+    url = "https://gnews.io/api/v4/search"
+    params = {
+        "q": query,
+        "token": GNEWS_API_KEY,
+        "lang": "en",
+        "max": 10,
+        "sort": "publishedAt"
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("articles", [])
+        else:
+            return []
+    except:
+        return []
+
+# -----------------------
+# 9️⃣ YouTube transcription
+# -----------------------
+def transcribe_youtube(url):
+    try:
+        tmpdir = tempfile.mkdtemp()
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'ffmpeg_location': r"C:\\ffmpeg\\ffmpeg-8.0-essentials_build\\bin"
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+
+        result = whisper_model.transcribe(filename)
+        return result["text"], info.get("title", "YouTube Video")
+    except Exception as e:
+        return f"Error transcribing video: {str(e)}", "Unknown Video"
+
+# -----------------------
+# 10️⃣ Streamlit UI
+# -----------------------
+st.set_page_config(page_title="FactCheck AI — Interactive", layout="wide")
+st.title("🧠 FactCheck AI — Real-Time Misinformation Detector")
+st.write("Paste news text or a YouTube URL. The app shows a misinformation score, why it may be misleading, fact-checking tips, and related news articles.")
+
+text_input = st.text_area("Enter news text or YouTube URL", height=220)
+
+if st.button("Check"):
+    if not text_input.strip():
+        st.warning("Please enter some text or URL.")
+    else:
+        with st.spinner("Processing..."):
+            if text_input.startswith("http"):
+                transcript, video_title = transcribe_youtube(text_input)
+                st.write(f"### Transcribed from: {video_title}")
+                st.write(transcript[:500] + "...")
+
+                st.subheader("📝 Summary (Bullet Points)")
+                bullet_summary = summarize_to_bullets(transcript)
+                for bullet in bullet_summary:
+                    st.markdown(bullet)
+
+                text_to_check = " ".join(bullet_summary)
+            else:
+                text_to_check = text_input
+
+            # Misinformation score
+            score, model_out = compute_misinfo_score(text_to_check)
+            category = categorize_score(score)
+            st.metric("Misinformation score (1 = low → 100 = high)", score)
+            st.write(f"**Category:** {category}")
+
+            # Explanation of misleading
+            st.subheader("❗ Why this might be misleading")
+            for reason in explain_misleading(text_to_check, score):
+                st.markdown(reason)
+
+            # Fact-checking tips
+            st.subheader("🛠 Fact-Checking Tips")
+            for tip in FACT_CHECK_TIPS:
+                st.markdown(tip)
+
+            # Trusted platforms
+            st.subheader("🔗 Trusted Fact-Checking Platforms")
+            for name, link in TRUSTED_SOURCES.items():
+                st.markdown(f"[{name}]({link})")
+
+            # Model signals
+            st.subheader("Model signals (top labels)")
+            st.write({k: round(v, 3) for k, v in zip(model_out["labels"], model_out["scores"])})
+
+            # GNews query preview
+            st.caption(f"🔍 GNews query: {extract_entities(text_to_check).strip()}")
+
+            # Real-time news feed
+            st.subheader("📰 Related News Articles")
+            articles = query_gnews(text_to_check)
+            if articles:
+                for art in articles:
+                    with st.expander(f"{art['title']} ({art['source']['name']})"):
+                        st.write(f"📅 Published: {art['publishedAt'][:10]}")
+                        st.write(f"📝 Summary: {art.get('description', 'No summary available.')}")
+                        st.markdown(f"[🔗 Read full article]({art['url']})")
+            else:
+                st.info("No matching articles found.")
