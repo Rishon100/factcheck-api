@@ -1,0 +1,177 @@
+// server.js
+const express = require('express');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const dotenv = require('dotenv');
+const cors = require('cors');
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Config from .env
+const PORT = process.env.PORT || 3000;
+const USE_WIKIPEDIA = (process.env.USE_WIKIPEDIA === 'true');
+const HYBRID = (process.env.HYBRID === 'true');
+const API_KEY = process.env.API_KEY || '';
+
+// Initialize Gemini client (keeps it available if you need it)
+let genAI = null;
+let model = null;
+if (API_KEY) {
+  try {
+    genAI = new GoogleGenerativeAI(API_KEY);
+    // include google_search tool if you want grounding (may require enabled access)
+    model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash",
+      tools: [{ google_search: {} }]
+    });
+    console.log('Gemini client initialized.');
+  } catch (e) {
+    console.warn('Could not initialize Gemini client. Gemini calls will fail until API_KEY is valid.');
+  }
+}
+
+// Helper: call Wikipedia (search -> summary)
+async function fetchFromWikipedia(query) {
+  try {
+    // 1) search for relevant page
+    const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json`;
+    const searchResp = await fetch(searchUrl);
+    if (!searchResp.ok) throw new Error(`Wiki search failed: ${searchResp.status}`);
+    const searchJson = await searchResp.json();
+    const hits = searchJson?.query?.search;
+    if (!hits || hits.length === 0) return null;
+
+    const title = hits[0].title; // top result
+    // 2) get summary
+    const summaryUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+    const summaryResp = await fetch(summaryUrl);
+    if (!summaryResp.ok) throw new Error(`Wiki summary failed: ${summaryResp.status}`);
+    const summaryJson = await summaryResp.json();
+
+    const extract = summaryJson.extract || '';
+    const url = summaryJson?.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g,'_'))}`;
+
+    return {
+      title,
+      extract,
+      url
+    };
+  } catch (err) {
+    console.error('Wikipedia fetch error:', err);
+    return null;
+  }
+}
+
+// Helper: call Gemini
+async function callGemini(prompt) {
+  if (!model) throw new Error('Gemini model not initialized or API_KEY missing');
+  // send prompt to model.generateContent
+  const result = await model.generateContent(prompt);
+  const response = result.response;
+  const text = response.text();
+  return { text, raw: result };
+}
+
+app.post('/verify', async (req, res) => {
+  const userQuery = (req.body.query || '').trim();
+  if (!userQuery) return res.status(400).send({ error: 'No query provided' });
+
+  console.log('Query:', userQuery);
+  const today = new Date().toDateString();
+
+  // If HYBRID: get wiki facts first, then ask Gemini to explain using those facts
+  if (HYBRID) {
+    try {
+      const wiki = await fetchFromWikipedia(userQuery);
+      let geminiResp = null;
+
+      if (wiki && model) {
+        const prompt = `
+You are an assistant that must explain and verify user questions using the provided factual text.
+User query: "${userQuery}"
+Today's date: ${today}
+
+---- FACTUAL SOURCE (do not invent new facts) ----
+Title: ${wiki.title}
+Summary: ${wiki.extract}
+URL: ${wiki.url}
+---- END SOURCE ----
+
+Task:
+1) Give a short "Summary" answer (1-2 sentences) directly addressing the user's question based on the source above.
+2) Provide 2 "Key Supporting Points" drawn only from the source above.
+3) Provide the "Trusted Source" link (the URL above).
+If the source above does not answer the question, say "No reliable source found".
+Do NOT invent additional URLs or facts.
+`;
+        const g = await callGemini(prompt);
+        geminiResp = g.text;
+      }
+
+      // If Gemini not available, return wiki raw data
+      if (!geminiResp) {
+        if (wiki) {
+          const text = `**Summary:** ${wiki.extract}\n\n**Trusted Source:** [${wiki.title}](${wiki.url})`;
+          return res.send({ result: text });
+        } else {
+          return res.send({ result: 'No reliable source found.' });
+        }
+      }
+      return res.send({ result: geminiResp });
+    } catch (err) {
+      console.error('HYBRID error:', err);
+      // fallback to simple wiki
+      const wiki = await fetchFromWikipedia(userQuery);
+      if (wiki) {
+        const text = `**Summary:** ${wiki.extract}\n\n**Trusted Source:** [${wiki.title}](${wiki.url})`;
+        return res.send({ result: text });
+      }
+      return res.status(500).send({ error: 'Something went wrong.' });
+    }
+  }
+
+  // If USE_WIKIPEDIA only
+  if (USE_WIKIPEDIA) {
+    const wiki = await fetchFromWikipedia(userQuery);
+    if (!wiki) return res.send({ result: 'No reliable source found on Wikipedia.' });
+
+    const text = `**Summary:** ${wiki.extract}\n\n**Trusted Source:** [${wiki.title}](${wiki.url})`;
+    return res.send({ result: text });
+  }
+
+  // Else: Gemini-only (or attempt Gemini, fallback to Wikipedia)
+  try {
+    const prompt = `
+Act as a real-time verification engine that uses up-to-date information.
+User query: "${userQuery}"
+Today's date: ${today}
+
+Format:
+1. **Summary:** Direct answer.
+2. **Key Supporting Points:** 2-3 facts.
+3. **Trusted Sources:** 2-3 real URLs. If you cannot find reliable sources, write "No reliable source found".
+Use Google Search grounding tool if available.
+`;
+    const g = await callGemini(prompt);
+    // if gemini returns text, send it
+    return res.send({ result: g.text });
+  } catch (err) {
+    console.error('Gemini error, falling back to Wikipedia:', err);
+    // If Gemini fails (e.g., 429), fallback
+    const wiki = await fetchFromWikipedia(userQuery);
+    if (wiki) {
+      const text = `**Summary:** ${wiki.extract}\n\n**Trusted Source:** [${wiki.title}](${wiki.url})`;
+      return res.send({ result: text });
+    } else {
+      return res.status(500).send({ error: 'Both Gemini and Wikipedia failed.' });
+    }
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`USE_WIKIPEDIA=${USE_WIKIPEDIA}  HYBRID=${HYBRID}`);
+});
